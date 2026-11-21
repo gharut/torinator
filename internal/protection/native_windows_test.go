@@ -15,10 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
-	"unsafe"
 
 	"github.com/gharut/torinator/internal/process"
 	"github.com/gharut/torinator/internal/settings"
@@ -101,6 +99,7 @@ func TestNativePersistentEnforcementAndCrash(t *testing.T) {
 		t.Fatal("administrator rights are required for the isolated WFP test")
 	}
 	dir := t.TempDir()
+	t.Logf("fixture directory: %s", dir)
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -313,8 +312,7 @@ func validateIsolated(p isolatedPolicy) error {
 }
 func echoServers(t *testing.T, tcpNetwork, udpNetwork, ip string) (string, string) {
 	t.Helper()
-	lc := net.ListenConfig{Control: inspectableLoopback}
-	listener, err := lc.Listen(context.Background(), tcpNetwork, net.JoinHostPort(ip, "0"))
+	listener, err := net.Listen(tcpNetwork, net.JoinHostPort(ip, "0"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,18 +342,6 @@ func echoServers(t *testing.T, tcpNetwork, udpNetwork, ip string) (string, strin
 		}
 	}()
 	return listener.Addr().String(), udp.LocalAddr().String()
-}
-
-// Force the ordinary TCP path on both sides of the fixture before connect or
-// listen. These socket-local options never change the host's network settings.
-func inspectableLoopback(_, _ string, raw syscall.RawConn) error {
-	var optionErr error
-	err := raw.Control(func(fd uintptr) {
-		var disabled, returned uint32
-		const sioLoopbackFastPath = 0x98000010
-		optionErr = windows.WSAIoctl(windows.Handle(fd), sioLoopbackFastPath, (*byte)(unsafe.Pointer(&disabled)), 4, nil, 0, &returned, nil, 0)
-	})
-	return errors.Join(err, optionErr)
 }
 
 type helperProcess struct {
@@ -484,11 +470,7 @@ func TestProtectionHelper(t *testing.T) {
 		network, address := args[1], args[2]
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		dialer := &net.Dialer{}
-		if strings.HasPrefix(network, "tcp") {
-			dialer.Control = inspectableLoopback
-		}
-		conn, err := dialer.DialContext(ctx, network, address)
+		conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
 		if err != nil {
 			if errors.Is(err, windows.WSAEACCES) {
 				fmt.Println("DENY")

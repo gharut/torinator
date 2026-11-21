@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -244,6 +245,37 @@ func nativeAppID(path string) ([]byte, error) {
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return nil, err
+	}
+	// The filename API does not resolve filesystem aliases. In particular, CI's
+	// TEMP may contain an 8.3 name such as RUNNER~1 while ALE reports the long
+	// executable path. Resolve through a handle before generating the app ID so
+	// deny rules and transport exceptions match the identity Windows classifies.
+	handle, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, 0, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open application identity: %w", err)
+	}
+	defer windows.CloseHandle(handle)
+	buf := make([]uint16, 512)
+	for {
+		n, err := windows.GetFinalPathNameByHandle(handle, &buf[0], uint32(len(buf)), 0)
+		if err != nil {
+			return nil, fmt.Errorf("resolve application identity: %w", err)
+		}
+		if n >= uint32(len(buf)) {
+			buf = make([]uint16, n+1)
+			continue
+		}
+		resolved := windows.UTF16ToString(buf[:n])
+		if strings.HasPrefix(resolved, `\\?\UNC\`) {
+			resolved = `\\` + strings.TrimPrefix(resolved, `\\?\UNC\`)
+		} else {
+			resolved = strings.TrimPrefix(resolved, `\\?\`)
+		}
+		name, err = windows.UTF16PtrFromString(resolved)
+		if err != nil {
+			return nil, err
+		}
+		break
 	}
 	var b *blob
 	if err := call("FwpmGetAppIdFromFileName0", uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(&b))); err != nil {
