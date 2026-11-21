@@ -15,8 +15,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/gharut/torinator/internal/process"
 	"github.com/gharut/torinator/internal/settings"
@@ -168,21 +170,6 @@ func TestNativePersistentEnforcementAndCrash(t *testing.T) {
 		}
 		s.close()
 	})
-	// Register the two test applications at ALE before creating the stream.
-	// This makes the fixture exercise an explicit permit-to-deny ALE policy
-	// transition instead of assuming that a loopback stream opened before the
-	// first policy was registered is tracked identically on every Windows build.
-	// Production explicitly permits loopback.
-	baseline := loopbackBaseline(policy)
-	if err := validateIsolated(isolatedPolicy{Provider: namespace, Sublayer: sl, Base: baseline, Applications: apps}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.replace(baseline); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.verify(baseline); err != nil {
-		t.Fatal(err)
-	}
 	tcp4, udp4 := echoServers(t, "tcp4", "udp4", "127.0.0.1")
 	tcp6, udp6 := echoServers(t, "tcp6", "udp6", "::1")
 	for _, endpoint := range []struct{ network, address string }{{"tcp4", tcp4}, {"udp4", udp4}, {"tcp6", tcp6}, {"udp6", udp6}} {
@@ -196,10 +183,11 @@ func TestNativePersistentEnforcementAndCrash(t *testing.T) {
 	if err := s.verify(append(append([]rule(nil), policy.Base...), policy.Tunnel...)); err != nil {
 		t.Fatal(err)
 	}
-	established.wait(t, "EXISTING_BLOCKED")
 	for _, endpoint := range []struct{ network, address string }{{"tcp4", tcp4}, {"udp4", udp4}, {"tcp6", tcp6}, {"udp6", udp6}} {
 		probeHelper(t, a, endpoint.network, endpoint.address, "DENY")
 	}
+	t.Log("new IPv4/IPv6 TCP and UDP connections are denied")
+	established.wait(t, "EXISTING_BLOCKED")
 	// Only the selected Tor transport executable may connect directly over TCP.
 	probeHelper(t, b, "tcp4", tcp4, "ALLOW")
 	probeHelper(t, b, "tcp6", tcp6, "ALLOW")
@@ -238,20 +226,6 @@ func TestNativePersistentEnforcementAndCrash(t *testing.T) {
 	for _, endpoint := range []struct{ network, address string }{{"tcp4", tcp4}, {"udp4", udp4}, {"tcp6", tcp6}, {"udp6", udp6}} {
 		probeHelper(t, a, endpoint.network, endpoint.address, "ALLOW")
 	}
-}
-
-func loopbackBaseline(p isolatedPolicy) []rule {
-	var rules []rule
-	for _, r := range p.Base {
-		if r.Action != actionBlock {
-			continue
-		}
-		r.Name = "baseline/" + r.Name
-		r.ID = ruleID(p.Provider, r.Name)
-		r.Action = actionPermit
-		rules = append(rules, r)
-	}
-	return rules
 }
 
 // Validate every production filter (including forwarding and early boot) in an
@@ -339,7 +313,8 @@ func validateIsolated(p isolatedPolicy) error {
 }
 func echoServers(t *testing.T, tcpNetwork, udpNetwork, ip string) (string, string) {
 	t.Helper()
-	listener, err := net.Listen(tcpNetwork, net.JoinHostPort(ip, "0"))
+	lc := net.ListenConfig{Control: inspectableLoopback}
+	listener, err := lc.Listen(context.Background(), tcpNetwork, net.JoinHostPort(ip, "0"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,6 +344,18 @@ func echoServers(t *testing.T, tcpNetwork, udpNetwork, ip string) (string, strin
 		}
 	}()
 	return listener.Addr().String(), udp.LocalAddr().String()
+}
+
+// Force the ordinary TCP path on both sides of the fixture before connect or
+// listen. These socket-local options never change the host's network settings.
+func inspectableLoopback(_, _ string, raw syscall.RawConn) error {
+	var optionErr error
+	err := raw.Control(func(fd uintptr) {
+		var disabled, returned uint32
+		const sioLoopbackFastPath = 0x98000010
+		optionErr = windows.WSAIoctl(windows.Handle(fd), sioLoopbackFastPath, (*byte)(unsafe.Pointer(&disabled)), 4, nil, 0, &returned, nil, 0)
+	})
+	return errors.Join(err, optionErr)
 }
 
 type helperProcess struct {
@@ -497,7 +484,11 @@ func TestProtectionHelper(t *testing.T) {
 		network, address := args[1], args[2]
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
+		dialer := &net.Dialer{}
+		if strings.HasPrefix(network, "tcp") {
+			dialer.Control = inspectableLoopback
+		}
+		conn, err := dialer.DialContext(ctx, network, address)
 		if err != nil {
 			if errors.Is(err, windows.WSAEACCES) {
 				fmt.Println("DENY")
