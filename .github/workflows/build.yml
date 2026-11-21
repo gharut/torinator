@@ -1,5 +1,10 @@
 name: Build Windows executable
-on: [push, workflow_dispatch]
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -16,4 +21,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: torinator-windows-amd64
-          path: dist/torinator.exe
+          path: |
+            dist/torinator.exe
+            dist/THIRD_PARTY_NOTICES.md
+            dist/README.md
+            dist/build-info.json

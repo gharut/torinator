@@ -1,0 +1,102 @@
+name: Release Windows
+run-name: Release next ${{ inputs.bump }} version from main
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version increment (first release is v0.1.0)
+        type: choice
+        required: true
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+# Serialize tag selection and publication, including the build in between.
+concurrency:
+  group: torinator-release-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Pin the main commit selected at dispatch; a later push cannot alter it.
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Calculate next version
+        id: version
+        env:
+          RELEASE_BUMP: ${{ inputs.bump }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git fetch origin --tags
+          if ($LASTEXITCODE) { throw 'Cannot refresh release tags.' }
+          $version = go run ./tools/nextversion -bump $env:RELEASE_BUMP
+          if ($LASTEXITCODE) { throw 'Cannot calculate the next release version.' }
+          "tag=$($version.Trim())" >> $env:GITHUB_OUTPUT
+      - name: Build and verify Windows release
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.tag }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: ./build.ps1 -Version $env:RELEASE_VERSION -Commit $env:RELEASE_COMMIT
+      - name: Package portable download and checksums
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = "dist/torinator-$env:RELEASE_VERSION-windows-amd64.zip"
+          Compress-Archive -LiteralPath dist/torinator.exe,dist/README.md,dist/THIRD_PARTY_NOTICES.md,dist/build-info.json -DestinationPath $zip
+          $checksums = foreach ($path in @('dist/torinator.exe', $zip)) {
+            $digest = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$digest  $([IO.Path]::GetFileName($path))"
+          }
+          $checksums | Set-Content -LiteralPath dist/SHA256SUMS.txt -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: torinator-${{ steps.version.outputs.tag }}-windows-amd64
+          if-no-files-found: error
+          path: |
+            dist/torinator.exe
+            dist/torinator-*-windows-amd64.zip
+            dist/SHA256SUMS.txt
+            dist/build-info.json
+      - name: Tag verified commit and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ steps.version.outputs.tag }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Never force or overwrite a tag/release. External tag races fail safely.
+          git tag $env:RELEASE_VERSION $env:RELEASE_COMMIT
+          if ($LASTEXITCODE) { throw 'Cannot create the release tag.' }
+          git push origin "refs/tags/$env:RELEASE_VERSION"
+          if ($LASTEXITCODE) { throw 'Cannot push the release tag.' }
+          $zip = "dist/torinator-$env:RELEASE_VERSION-windows-amd64.zip"
+          gh release create $env:RELEASE_VERSION dist/torinator.exe $zip dist/SHA256SUMS.txt dist/build-info.json --verify-tag --draft --title "Torinator $env:RELEASE_VERSION" --generate-notes
+          if ($LASTEXITCODE) { throw 'Release upload failed; inspect the draft and tag before retrying.' }
+          gh release edit $env:RELEASE_VERSION --draft=false --latest
+          if ($LASTEXITCODE) { throw 'Release publication failed; the uploaded draft can be published manually.' }
+          "### Released Torinator $env:RELEASE_VERSION" >> $env:GITHUB_STEP_SUMMARY
+          "Commit: $env:RELEASE_COMMIT" >> $env:GITHUB_STEP_SUMMARY
+          "[Download release](https://github.com/$env:GH_REPO/releases/tag/$env:RELEASE_VERSION)" >> $env:GITHUB_STEP_SUMMARY

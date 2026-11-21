@@ -1,2 +1,7 @@
 /cmd/torinator/bundle.tar.gz
+/internal/assets/*.zip
+/internal/assets/*.gz
+/internal/assets/*.reference.txt
+/internal/assets/*-go.mod.txt
 /dist/
+/cmd/torinator/*_windows_amd64.syso
