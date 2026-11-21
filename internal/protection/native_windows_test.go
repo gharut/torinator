@@ -99,6 +99,7 @@ func TestNativePersistentEnforcementAndCrash(t *testing.T) {
 		t.Fatal("administrator rights are required for the isolated WFP test")
 	}
 	dir := t.TempDir()
+	t.Logf("fixture directory: %s", dir)
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -181,10 +182,11 @@ func TestNativePersistentEnforcementAndCrash(t *testing.T) {
 	if err := s.verify(append(append([]rule(nil), policy.Base...), policy.Tunnel...)); err != nil {
 		t.Fatal(err)
 	}
-	established.wait(t, "EXISTING_BLOCKED")
 	for _, endpoint := range []struct{ network, address string }{{"tcp4", tcp4}, {"udp4", udp4}, {"tcp6", tcp6}, {"udp6", udp6}} {
 		probeHelper(t, a, endpoint.network, endpoint.address, "DENY")
 	}
+	t.Log("new IPv4/IPv6 TCP and UDP connections are denied")
+	established.wait(t, "EXISTING_BLOCKED")
 	// Only the selected Tor transport executable may connect directly over TCP.
 	probeHelper(t, b, "tcp4", tcp4, "ALLOW")
 	probeHelper(t, b, "tcp6", tcp6, "ALLOW")
