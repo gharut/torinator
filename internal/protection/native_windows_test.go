@@ -168,6 +168,21 @@ func TestNativePersistentEnforcementAndCrash(t *testing.T) {
 		}
 		s.close()
 	})
+	// Register the two test applications at ALE before creating the stream.
+	// This makes the fixture exercise an explicit permit-to-deny ALE policy
+	// transition instead of assuming that a loopback stream opened before the
+	// first policy was registered is tracked identically on every Windows build.
+	// Production explicitly permits loopback.
+	baseline := loopbackBaseline(policy)
+	if err := validateIsolated(isolatedPolicy{Provider: namespace, Sublayer: sl, Base: baseline, Applications: apps}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.replace(baseline); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.verify(baseline); err != nil {
+		t.Fatal(err)
+	}
 	tcp4, udp4 := echoServers(t, "tcp4", "udp4", "127.0.0.1")
 	tcp6, udp6 := echoServers(t, "tcp6", "udp6", "::1")
 	for _, endpoint := range []struct{ network, address string }{{"tcp4", tcp4}, {"udp4", udp4}, {"tcp6", tcp6}, {"udp6", udp6}} {
@@ -223,6 +238,20 @@ func TestNativePersistentEnforcementAndCrash(t *testing.T) {
 	for _, endpoint := range []struct{ network, address string }{{"tcp4", tcp4}, {"udp4", udp4}, {"tcp6", tcp6}, {"udp6", udp6}} {
 		probeHelper(t, a, endpoint.network, endpoint.address, "ALLOW")
 	}
+}
+
+func loopbackBaseline(p isolatedPolicy) []rule {
+	var rules []rule
+	for _, r := range p.Base {
+		if r.Action != actionBlock {
+			continue
+		}
+		r.Name = "baseline/" + r.Name
+		r.ID = ruleID(p.Provider, r.Name)
+		r.Action = actionPermit
+		rules = append(rules, r)
+	}
+	return rules
 }
 
 // Validate every production filter (including forwarding and early boot) in an
