@@ -58,6 +58,10 @@ jobs:
           RELEASE_VERSION: ${{ steps.version.outputs.tag }}
           RELEASE_COMMIT: ${{ github.sha }}
         run: ./build.ps1 -Version $env:RELEASE_VERSION -Commit $env:RELEASE_COMMIT
+      - name: Verify isolated Windows enforcement and crash recovery
+        env:
+          TORINATOR_PROTECTION_TEST: '1'
+        run: go test ./internal/protection -run '^TestNative' -count=1 -timeout 90s -v
       - name: Package portable download and checksums
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.tag }}

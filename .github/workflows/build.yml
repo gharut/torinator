@@ -18,6 +18,11 @@ jobs:
           cache: false
       - shell: pwsh
         run: ./build.ps1
+      - name: Verify isolated Windows enforcement and crash recovery
+        shell: pwsh
+        env:
+          TORINATOR_PROTECTION_TEST: '1'
+        run: go test ./internal/protection -run '^TestNative' -count=1 -timeout 90s -v
       - uses: actions/upload-artifact@v4
         with:
           name: torinator-windows-amd64

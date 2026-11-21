@@ -93,6 +93,7 @@ type ui struct {
 	added, quitting bool
 	quitDone        chan error
 	quitErr         error
+	preferences     *settingsWindow
 }
 
 func Run(controller *app.Controller, logPath string) error {
@@ -110,6 +111,7 @@ func run(controller *app.Controller, logPath string, ready func(uintptr)) error 
 	}()
 	for state, color := range map[app.State][3]byte{
 		app.Disconnected: {130, 139, 151}, app.Connecting: {236, 172, 46}, app.Connected: {42, 188, 120}, app.Failed: {224, 74, 86},
+		app.Protected: {42, 188, 120}, app.Blocked: {224, 74, 86},
 	} {
 		icon, err := makeIcon(color)
 		if err != nil {
@@ -124,7 +126,7 @@ func run(controller *app.Controller, logPath string, ready func(uintptr)) error 
 	if err != nil {
 		return err
 	}
-	wc := windowClass{WndProc: callback, Instance: uintptr(instance), ClassName: className}
+	wc := windowClass{WndProc: callback, Instance: uintptr(instance), ClassName: className, Background: 16}
 	wc.Size = uint32(unsafe.Sizeof(wc))
 	if r, _, err := registerClass.Call(uintptr(unsafe.Pointer(&wc))); r == 0 {
 		return fmt.Errorf("register tray window: %w", err)
@@ -158,18 +160,33 @@ func run(controller *app.Controller, logPath string, ready func(uintptr)) error 
 		if r == 0 {
 			return u.quitErr
 		}
+		if u.preferences != nil {
+			if handled, _, _ := isDialogMessage.Call(u.preferences.window, uintptr(unsafe.Pointer(&msg))); handled != 0 {
+				continue
+			}
+		}
 		translateMessage.Call(uintptr(unsafe.Pointer(&msg)))
 		dispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
 	}
 }
 
 func (u *ui) windowProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
+	if u.preferences != nil && hwnd == u.preferences.window {
+		return u.preferences.handle(hwnd, msg, wparam, lparam)
+	}
 	if msg == u.taskbarCreated && u.taskbarCreated != 0 {
 		u.added = false
 		_ = u.refresh(true)
 		return 0
 	}
 	switch msg {
+	case wmCommand:
+		if wparam&0xffff == 7 {
+			if err := u.showSettings(); err != nil {
+				Alert("Settings", err.Error())
+			}
+		}
+		return 0
 	case wmTray:
 		if lparam == 0x0202 || lparam == 0x0205 || lparam == 0x007b {
 			u.menu()
@@ -242,6 +259,9 @@ func (u *ui) quit() {
 		return
 	}
 	u.quitting = true
+	if u.preferences != nil {
+		destroyWindow.Call(u.preferences.window)
+	}
 	go func() { u.quitDone <- u.controller.Close(); postMessage.Call(u.window, wmQuitReady, 0, 0) }()
 }
 func (u *ui) menu() {
@@ -261,13 +281,19 @@ func (u *ui) menu() {
 	item(0, "Torinator "+buildinfo.Version+"  ·  "+string(s.State), true)
 	appendMenu.Call(menu, 0x0800, 0, 0)
 	busy := s.State == app.Disconnecting || s.State == app.Resetting || u.quitting
-	item(1, "Connect", busy || s.State == app.Connected || s.State == app.Degraded || s.State == app.Connecting)
+	active := s.State == app.Connected || s.State == app.Protected || s.State == app.Degraded || s.State == app.Connecting
+	item(1, "Connect", busy || u.preferences != nil || active)
 	item(2, "Disconnect", busy || s.State == app.Disconnected)
 	item(3, "Reset network changes", busy)
+	item(7, "Settings…", busy || active)
 	appendMenu.Call(menu, 0x0800, 0, 0)
 	item(4, "Show status…", false)
 	item(5, "Open log", false)
-	item(6, "Exit", u.quitting)
+	exitLabel := "Exit"
+	if s.State != app.Disconnected {
+		exitLabel = "Exit (keep protection armed)"
+	}
+	item(6, exitLabel, u.quitting)
 	var p point
 	getCursorPos.Call(uintptr(unsafe.Pointer(&p)))
 	setForegroundWindow.Call(u.window)
@@ -282,9 +308,9 @@ func (u *ui) menu() {
 		u.controller.Disconnect(true)
 	case 4:
 		Alert("Torinator — "+string(s.State), s.Detail+"\n\n"+strings.Join([]string{
-			"Green: routing verified through Tor.", "Amber: connecting, cleaning up, or Tor check failed.", "Grey: normal Windows routing.", "Red: error; open the log for details.",
-			"", "Tor supports TCP. Other UDP and ping are blocked by the active tunnel.",
-			"Disconnect, Exit, or a routing-process crash restores ordinary networking.",
+			"Protected: Windows enforcement and direct TCP/UDP denial probes passed, and the proxy is reachable.", "Amber: connecting, cleaning up, or connectivity check failed.", "Grey: normal Windows routing.", "Blocked: direct access remains blocked; the tunnel is stopped. Red errors may require Reset.",
+			"", "Tor supports TCP. Custom SOCKS5 supports TCP and UDP relay when the proxy provides it. ICMP/ping is blocked.",
+			"A crash or Exit keeps protection armed. Disconnect or Reset explicitly restores normal networking.",
 		}, "\n"))
 	case 5:
 		if err := platform.OpenFile(u.logPath); err != nil {
@@ -292,6 +318,10 @@ func (u *ui) menu() {
 		}
 	case 6:
 		u.quit()
+	case 7:
+		if err := u.showSettings(); err != nil {
+			Alert("Settings", err.Error())
+		}
 	}
 }
 func Alert(title, text string) {

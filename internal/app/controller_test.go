@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"github.com/gharut/torinator/internal/settings"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,35 @@ type fakeBackend struct {
 	connect func(context.Context, func(string)) (Connection, error)
 	resets  atomic.Int32
 	reset   func() error
+}
+
+func TestSettingsPersistWithoutConnectingAndCannotChangeAnActiveSession(t *testing.T) {
+	store, err := settings.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &fakeConnection{done: make(chan struct{})}
+	var connects atomic.Int32
+	b := &fakeBackend{connect: func(context.Context, func(string)) (Connection, error) { connects.Add(1); return s, nil }}
+	c := NewWithSettings(b, store, nil)
+	custom := settings.Config{Mode: settings.SOCKS5, Proxy: settings.Proxy{Host: "203.0.113.4", Port: 1080}}
+	if err := c.SaveSettings(custom); err != nil {
+		t.Fatal(err)
+	}
+	if c.Settings() != custom || connects.Load() != 0 {
+		t.Fatal("saving settings must not start a connection")
+	}
+	c.Connect()
+	waitStatus(t, c, Connected)
+	if err := c.SaveSettings(settings.Default()); err == nil {
+		t.Fatal("changed settings during an active session")
+	}
+	if c.Settings() != custom {
+		t.Fatal("failed save changed the selected provider")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (b *fakeBackend) Connect(ctx context.Context, p func(string)) (Connection, error) {
@@ -28,21 +58,110 @@ func (b *fakeBackend) Reset() error {
 }
 
 type fakeConnection struct {
-	done    chan struct{}
-	once    sync.Once
-	stops   atomic.Int32
-	err     error
-	stopErr error
-	health  chan error
+	done      chan struct{}
+	once      sync.Once
+	stops     atomic.Int32
+	err       error
+	stopErr   error
+	health    chan error
+	protected bool
 }
 
-func (s *fakeConnection) Done() <-chan struct{} { return s.done }
-func (s *fakeConnection) Health() <-chan error  { return s.health }
-func (s *fakeConnection) Err() error            { return s.err }
+func (s *fakeConnection) Done() <-chan struct{}    { return s.done }
+func (s *fakeConnection) Health() <-chan error     { return s.health }
+func (s *fakeConnection) ProtectionVerified() bool { return s.protected }
+func (s *fakeConnection) Err() error               { return s.err }
 func (s *fakeConnection) Stop() error {
 	s.stops.Add(1)
 	s.once.Do(func() { close(s.done) })
 	return s.stopErr
+}
+
+type protectedBackend struct {
+	fakeBackend
+	armed      atomic.Bool
+	inspectErr error
+}
+
+func (b *protectedBackend) ProtectionState() (bool, error) { return b.armed.Load(), b.inspectErr }
+func (b *protectedBackend) Reset() error {
+	b.resets.Add(1)
+	if b.reset != nil {
+		if err := b.reset(); err != nil {
+			return err
+		}
+	}
+	b.armed.Store(false)
+	return nil
+}
+
+func TestProtectedCrashAndExitStayBlockedUntilExplicitDisconnect(t *testing.T) {
+	for _, action := range []string{"crash", "exit"} {
+		t.Run(action, func(t *testing.T) {
+			s := &fakeConnection{done: make(chan struct{}), protected: true, err: errors.New("proxy process stopped")}
+			b := &protectedBackend{}
+			b.connect = func(context.Context, func(string)) (Connection, error) { b.armed.Store(true); return s, nil }
+			c := NewWithSettings(b, nil, nil)
+			c.Connect()
+			waitStatus(t, c, Protected)
+			if action == "crash" {
+				s.once.Do(func() { close(s.done) })
+				waitStatus(t, c, Blocked)
+			} else {
+				if err := c.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if c.Status().State != Blocked {
+					t.Fatal(c.Status())
+				}
+			}
+			if !b.armed.Load() || b.resets.Load() != 0 {
+				t.Fatal("crash/Exit released persistent enforcement")
+			}
+			// Simulate reopening after Exit/crash. Only explicit Disconnect releases.
+			reopened := NewWithSettings(b, nil, nil)
+			if reopened.Status().State != Blocked {
+				t.Fatal("startup failed to show persisted blocking")
+			}
+			reopened.Disconnect(false)
+			waitStatus(t, reopened, Disconnected)
+			if b.armed.Load() || b.resets.Load() != 1 {
+				t.Fatal("explicit Disconnect did not restore access")
+			}
+		})
+	}
+}
+func TestFailedProtectedStartupAndCleanupNeverUnblock(t *testing.T) {
+	b := &protectedBackend{}
+	b.connect = func(context.Context, func(string)) (Connection, error) {
+		b.armed.Store(true)
+		return nil, errors.New("proxy failed")
+	}
+	c := NewWithSettings(b, nil, nil)
+	c.Connect()
+	waitStatus(t, c, Blocked)
+	b.reset = func() error { return errors.New("adapter cleanup failed") }
+	c.Disconnect(true)
+	c.op.Lock()
+	c.op.Unlock()
+	// Wait for the queued reset rather than just the existing Blocked state.
+	deadline := time.Now().Add(3 * time.Second)
+	for b.resets.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	c.op.Lock()
+	c.op.Unlock()
+	if !b.armed.Load() || c.Status().State != Blocked {
+		t.Fatal("failed cleanup released protection")
+	}
+}
+func TestUnknownProtectionIsNotReportedAsProtectedOrNormal(t *testing.T) {
+	b := &protectedBackend{inspectErr: errors.New("WFP inspection unavailable")}
+	b.armed.Store(true)
+	c := NewWithSettings(b, nil, nil)
+	if c.Status().State != Failed {
+		t.Fatal(c.Status())
+	}
 }
 
 func waitStatus(t *testing.T, c *Controller, state State) {

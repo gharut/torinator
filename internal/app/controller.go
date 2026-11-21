@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/gharut/torinator/internal/settings"
 	"sync"
 )
 
@@ -14,6 +15,8 @@ const (
 	Disconnected  State = "Disconnected"
 	Connecting    State = "Connecting"
 	Connected     State = "Connected"
+	Protected     State = "Protected"
+	Blocked       State = "Blocked"
 	Degraded      State = "Tunnel unverified"
 	Disconnecting State = "Disconnecting"
 	Resetting     State = "Resetting"
@@ -44,10 +47,73 @@ type Controller struct {
 	changed    func(Status)
 	closing    bool
 	pending    bool
+	settings   *settings.Store
 }
 
 func New(backend Backend, changed func(Status)) *Controller {
 	return &Controller{backend: backend, changed: changed, status: Status{Disconnected, "Normal Windows routing"}}
+}
+func NewWithSettings(backend Backend, store *settings.Store, changed func(Status)) *Controller {
+	c := New(backend, changed)
+	c.settings = store
+	c.idle(Disconnected, "Normal Windows routing")
+	return c
+}
+func (c *Controller) Settings() settings.Config {
+	if c.settings == nil {
+		return settings.Default()
+	}
+	return c.settings.Current()
+}
+func (c *Controller) SaveSettings(config settings.Config) error {
+	if !c.op.TryLock() {
+		return fmt.Errorf("disconnect before changing proxy settings")
+	}
+	defer c.op.Unlock()
+	c.mu.Lock()
+	busy := c.connection != nil || c.pending || c.closing
+	c.mu.Unlock()
+	if busy {
+		return fmt.Errorf("disconnect before changing proxy settings")
+	}
+	if c.settings == nil {
+		return fmt.Errorf("settings storage is unavailable")
+	}
+	if err := c.settings.Save(config); err != nil {
+		return err
+	}
+	c.idle(Disconnected, c.settings.Current().Label()+" selected")
+	return nil
+}
+
+type protectionBackend interface{ ProtectionState() (bool, error) }
+
+func (c *Controller) idle(fallback State, detail string) {
+	if backend, ok := c.backend.(protectionBackend); ok {
+		active, err := backend.ProtectionState()
+		if err != nil {
+			c.set(Failed, detail+"; protection cannot be confirmed: "+err.Error()+". Use Reset to recover.")
+			return
+		}
+		if active {
+			c.set(Blocked, detail+"; direct access remains blocked. Connect to retry, or Disconnect/Reset to restore normal access.")
+			return
+		}
+	}
+	c.set(fallback, detail)
+}
+func connectionState(conn Connection) State {
+	if p, ok := conn.(interface{ ProtectionVerified() bool }); ok && p.ProtectionVerified() {
+		return Protected
+	}
+	return Connected
+}
+
+func description(conn Connection) string {
+	if describer, ok := conn.(interface{ Description() string }); ok {
+		return describer.Description()
+	}
+	return "TCP and DNS through Tor; other UDP blocked"
 }
 func (c *Controller) Status() Status { c.mu.Lock(); defer c.mu.Unlock(); return c.status }
 func (c *Controller) set(state State, detail string) {
@@ -99,17 +165,17 @@ func (c *Controller) Connect() {
 				pending := c.pending || c.closing
 				c.mu.Unlock()
 				if !pending {
-					c.set(Disconnected, "Normal Windows routing")
+					c.idle(Disconnected, "Connection canceled")
 				}
 			} else {
-				c.set(Failed, err.Error())
+				c.idle(Failed, err.Error())
 			}
 			return
 		}
 		c.mu.Lock()
 		c.connection = conn
 		c.mu.Unlock()
-		c.set(Connected, "TCP and DNS through Tor; other UDP blocked")
+		c.set(connectionState(conn), description(conn))
 		go func() {
 			var health <-chan error
 			if reporter, ok := conn.(interface{ Health() <-chan error }); ok {
@@ -124,9 +190,9 @@ func (c *Controller) Connect() {
 					c.mu.Unlock()
 					if current {
 						if healthErr != nil {
-							c.set(Degraded, "Tunnel remains active; Tor check failed: "+healthErr.Error())
+							c.set(Degraded, "Tunnel remains active; connectivity check failed: "+healthErr.Error())
 						} else {
-							c.set(Connected, "TCP and DNS through Tor; last Tor check passed")
+							c.set(connectionState(conn), description(conn))
 						}
 					}
 					c.op.Unlock()
@@ -144,9 +210,9 @@ func (c *Controller) Connect() {
 					}
 					cause := conn.Err()
 					if err := c.stop(); err != nil {
-						c.set(Failed, fmt.Sprintf("%v; cleanup failed: %v. Use Reset to retry.", cause, err))
+						c.idle(Failed, fmt.Sprintf("%v; cleanup failed: %v. Use Reset to retry.", cause, err))
 					} else {
-						c.set(Failed, fmt.Sprintf("%v; normal Windows routing restored", cause))
+						c.idle(Failed, fmt.Sprintf("%v; routing process stopped", cause))
 					}
 					return
 				}
@@ -176,20 +242,17 @@ func (c *Controller) Disconnect(reset bool) {
 		} else {
 			c.set(Disconnecting, "Restoring normal Windows routing")
 		}
-		c.mu.Lock()
-		hadConnection := c.connection != nil
-		c.mu.Unlock()
 		err := c.stop()
-		// Startup may have failed while rolling back. Retry backend recovery
-		// before showing Disconnected even when no Connection was returned.
-		if reset || !hadConnection {
-			err = errors.Join(err, c.backend.Reset())
+		// Only explicit Disconnect/Reset releases persistent enforcement, and
+		// only after all live tunnel resources have been stopped successfully.
+		if err == nil {
+			err = c.backend.Reset()
 		}
 		if err != nil {
-			c.set(Failed, err.Error())
+			c.idle(Failed, err.Error())
 			return
 		}
-		c.set(Disconnected, "Normal Windows routing")
+		c.idle(Disconnected, "Normal Windows routing")
 	}()
 }
 func (c *Controller) stop() error {
@@ -216,11 +279,16 @@ func (c *Controller) Close() error {
 	c.op.Lock()
 	defer c.op.Unlock()
 	c.set(Disconnecting, "Restoring normal Windows routing")
-	err := errors.Join(c.stop(), c.backend.Reset())
+	err := c.stop()
+	// Production backends keep protection armed across Exit/logoff. Legacy
+	// non-protected test/backends retain their ordinary resource cleanup.
+	if _, protected := c.backend.(protectionBackend); !protected {
+		err = errors.Join(err, c.backend.Reset())
+	}
 	if err != nil {
-		c.set(Failed, err.Error())
+		c.idle(Failed, err.Error())
 	} else {
-		c.set(Disconnected, "Normal Windows routing")
+		c.idle(Disconnected, "Stopped")
 	}
 	return err
 }

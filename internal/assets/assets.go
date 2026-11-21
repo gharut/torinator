@@ -34,11 +34,18 @@ type Runtime struct {
 
 // Extract requires an empty private directory. No downloads occur at runtime.
 func Extract(dir string) (Runtime, error) {
+	return ExtractForMode(dir, true)
+}
+
+// Custom proxy mode never extracts or starts the embedded Tor runtime.
+func ExtractForMode(dir string, includeTor bool) (Runtime, error) {
 	r := Runtime{Directory: dir}
 	var err error
-	r.Tor, err = tor.Unpack(bytes.NewReader(torArchive), filepath.Join(dir, "tor"))
-	if err != nil {
-		return r, fmt.Errorf("extract Tor: %w", err)
+	if includeTor {
+		r.Tor, err = tor.Unpack(bytes.NewReader(torArchive), filepath.Join(dir, "tor"))
+		if err != nil {
+			return r, fmt.Errorf("extract Tor: %w", err)
+		}
 	}
 	if err = extractZIP(singArchive, filepath.Join(dir, "sing-box"), map[string]string{
 		"sing-box-1.14.4-windows-amd64/sing-box.exe":  "sing-box.exe",
